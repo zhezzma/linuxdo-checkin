@@ -3,64 +3,29 @@ cron: 0 */6 * * *
 new Env("Linux.Do 签到")
 """
 
+import json
 import os
-import random
 import time
-import functools
+from dotenv import load_dotenv
 from loguru import logger
 from DrissionPage import ChromiumOptions, Chromium
-from tabulate import tabulate
-from curl_cffi import requests
-from bs4 import BeautifulSoup
-from notify import NotificationManager
 
-
-def retry_decorator(retries=3, min_delay=5, max_delay=10):
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            for attempt in range(retries):
-                try:
-                    return func(*args, **kwargs)
-                except Exception as e:
-                    if attempt == retries - 1:  # 最后一次尝试
-                        logger.error(f"函数 {func.__name__} 最终执行失败: {str(e)}")
-                    logger.warning(
-                        f"函数 {func.__name__} 第 {attempt + 1}/{retries} 次尝试失败: {str(e)}"
-                    )
-                    if attempt < retries - 1:
-                        sleep_s = random.uniform(min_delay, max_delay)
-                        logger.info(
-                            f"将在 {sleep_s:.2f}s 后重试 ({min_delay}-{max_delay}s 随机延迟)"
-                        )
-                        time.sleep(sleep_s)
-            return None
-
-        return wrapper
-
-    return decorator
-
+load_dotenv()  # 读取本地 .env 文件（青龙/GitHub Actions 无该文件时自动忽略）
 
 os.environ.pop("DISPLAY", None)
 os.environ.pop("DYLD_LIBRARY_PATH", None)
 
-USERNAME = os.environ.get("LINUXDO_USERNAME")
-PASSWORD = os.environ.get("LINUXDO_PASSWORD")
-COOKIES = os.environ.get("LINUXDO_COOKIES", "").strip()  # 手动设置的 Cookie 字符串，优先使用
-BROWSE_ENABLED = os.environ.get("BROWSE_ENABLED", "true").strip().lower() not in [
-    "false",
-    "0",
-    "off",
-]
-if not USERNAME:
-    USERNAME = os.environ.get("USERNAME")
-if not PASSWORD:
-    PASSWORD = os.environ.get("PASSWORD")
+COOKIES = os.environ.get("LINUXDO_COOKIES", "").strip()  # 手动设置的 Cookie 字符串
+# 本地调试用：指定浏览器路径（如 Edge）、是否无头；不设置时默认无头 + 自动探测 Chrome
+BROWSER_PATH = os.environ.get("BROWSER_PATH", "").strip()
+HEADLESS = os.environ.get("HEADLESS", "true").strip().lower() not in ("false", "0", "off")
 
 HOME_URL = "https://linux.do/"
-LOGIN_URL = "https://linux.do/login"
-SESSION_URL = "https://linux.do/session"
-CSRF_URL = "https://linux.do/session/csrf"
+
+# turnstilePatch 扩展：自动求解 Cloudflare Turnstile 质询
+EXTENSION_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "turnstilePatch")
+)
 
 
 class LinuxDoBrowser:
@@ -78,25 +43,21 @@ class LinuxDoBrowser:
 
         co = (
             ChromiumOptions()
-            .headless(True)
-            .incognito(True)
+            .headless(HEADLESS)
+            .auto_port(True)
             .set_argument("--no-sandbox")
         )
+        if BROWSER_PATH:
+            co.set_browser_path(BROWSER_PATH)
+        # 加载 turnstilePatch 扩展以自动通过 Cloudflare Turnstile 质询
+        # 注意：扩展在无痕模式下不会生效，故改用 auto_port 的临时配置目录隔离每次运行
+        if os.path.exists(EXTENSION_PATH):
+            co.add_extension(EXTENSION_PATH)
         co.set_user_agent(
             f"Mozilla/5.0 ({platformIdentifier}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
         )
         self.browser = Chromium(co)
         self.page = self.browser.new_tab()
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0",
-                "Accept": "application/json, text/javascript, */*; q=0.01",
-                "Accept-Language": "zh-CN,zh;q=0.9",
-            }
-        )
-        # 初始化通知管理器
-        self.notifier = NotificationManager()
 
     @staticmethod
     def parse_cookie_string(cookie_str: str) -> list[dict]:
@@ -119,8 +80,80 @@ class LinuxDoBrowser:
                 )
         return cookies
 
+    def _detect_cloudflare(self) -> str:
+        """检测当前页面 Cloudflare 质询状态：none / waiting / solved。"""
+        try:
+            return self.page.run_js(
+                r"""
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+const cfPresent = !!cfInput
+  || !!document.querySelector('iframe[src*="turnstile"], iframe[src*="/cdn-cgi/challenge-platform/"], div.cf-turnstile, [data-sitekey]');
+if (!cfPresent) return 'none';
+const token = String((cfInput && cfInput.value) || '').trim();
+return token.length >= 80 ? 'solved' : 'waiting';
+                """
+            )
+        except Exception:
+            return "none"
+
+    def _solve_turnstile(self):
+        """主动复用 Turnstile 组件求解：reset 后点击复选框 iframe。"""
+        try:
+            self.page.run_js(
+                "try { if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset(); } catch(e) {}"
+            )
+        except Exception:
+            pass
+        try:
+            challenge_input = self.page.ele("@name=cf-turnstile-response", timeout=1)
+        except Exception:
+            challenge_input = None
+        if challenge_input:
+            try:
+                iframe = challenge_input.parent().shadow_root.ele("tag:iframe")
+                if iframe:
+                    iframe.click()
+                    time.sleep(1)
+            except Exception:
+                pass
+        else:
+            # 兜底：点击可见的 turnstile / 质询平台 iframe
+            try:
+                self.page.run_js(
+                    r"""
+const n = document.querySelector('iframe[src*="turnstile"], iframe[src*="/cdn-cgi/challenge-platform/"]');
+if (n && n.click) n.click();
+                    """
+                )
+            except Exception:
+                pass
+
+    def wait_for_cloudflare(self, timeout=30) -> bool:
+        """等待 Cloudflare Turnstile 质询通过。
+
+        依赖 turnstilePatch 扩展自动求解；卡住时主动复用 Turnstile 组件重试。
+        返回 True 表示质询已通过或不存在，False 表示超时仍在质询中。
+        """
+        time.sleep(2)  # 等待质询平台 iframe 加载，避免误判为无质询
+        deadline = time.time() + timeout
+        last_solve_at = 0.0
+        while time.time() < deadline:
+            state = self._detect_cloudflare()
+            if state in ("none", "solved"):
+                if state == "solved":
+                    logger.success("Cloudflare Turnstile 质询已通过")
+                return True
+            if time.time() - last_solve_at >= 5:
+                logger.info("Cloudflare 质询进行中，尝试主动求解...")
+                self._solve_turnstile()
+                last_solve_at = time.time()
+            time.sleep(1)
+        still = self._detect_cloudflare()
+        logger.warning(f"Cloudflare 质询等待超时，当前状态: {still}")
+        return still in ("none", "solved")
+
     def login_with_cookies(self, cookie_str: str) -> bool:
-        """使用手动设置的 Cookie 直接登录，跳过账号密码流程"""
+        """使用手动设置的 Cookie 直接登录"""
         logger.info("检测到手动 Cookie，尝试 Cookie 登录...")
         dp_cookies = self.parse_cookie_string(cookie_str)
         if not dp_cookies:
@@ -129,15 +162,13 @@ class LinuxDoBrowser:
 
         logger.info(f"成功解析 {len(dp_cookies)} 个 Cookie 条目")
 
-        # 同步到 requests.Session，以便后续 API 请求（如 print_connect_info）使用
-        for ck in dp_cookies:
-            self.session.cookies.set(ck["name"], ck["value"], domain="linux.do")
-
-        # 同步到 DrissionPage
+        # 设置 Cookie 到 DrissionPage
         self.page.set.cookies(dp_cookies)
         logger.info("Cookie 设置完成，导航至 linux.do...")
         self.page.get(HOME_URL)
-        time.sleep(5)
+
+        # 处理 Cloudflare Turnstile 质询
+        self.wait_for_cloudflare(timeout=30)
 
         # 验证登录状态
         try:
@@ -155,174 +186,104 @@ class LinuxDoBrowser:
             logger.info("Cookie 登录验证成功")
             return True
 
-    def login(self):
-        logger.info("开始账号密码登录")
-        # Step 1: Get CSRF Token
-        logger.info("获取 CSRF token...")
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0",
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Accept-Language": "zh-CN,zh;q=0.9",
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": LOGIN_URL,
-        }
-        resp_csrf = self.session.get(CSRF_URL, headers=headers, impersonate="firefox135")
-        if resp_csrf.status_code != 200:
-            logger.error(f"获取 CSRF token 失败: {resp_csrf.status_code}")
-            return False        
-        csrf_data = resp_csrf.json()
-        csrf_token = csrf_data.get("csrf")
-        logger.info(f"CSRF Token obtained: {csrf_token[:10]}...")
+    def _fetch_json(self, url):
+        """在已登录的页面上下文中用同步 XHR 请求 JSON 接口（自带 cookie 与 CF 放行）。"""
+        try:
+            text = self.page.run_js(
+                r"""
+const url = arguments[0];
+const xhr = new XMLHttpRequest();
+xhr.open('GET', url, false);
+xhr.setRequestHeader('Accept', 'application/json, text/javascript, */*; q=0.01');
+xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+xhr.send();
+if (xhr.status !== 200) return 'HTTP_ERROR:' + xhr.status;
+return xhr.responseText;
+                """,
+                url,
+            )
+        except Exception as e:
+            logger.warning(f"请求 {url} 失败: {e}")
+            return None
+        if isinstance(text, str) and text.startswith("HTTP_ERROR:"):
+            logger.warning(f"{url} 返回异常: {text}")
+            return None
+        try:
+            return json.loads(text)
+        except Exception as e:
+            logger.warning(f"解析 JSON 失败 ({url}): {e}")
+            return None
 
-        # Step 2: Login
-        logger.info("正在登录...")
-        headers.update(
-            {
-                "X-CSRF-Token": csrf_token,
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Origin": "https://linux.do",
-            }
+    @staticmethod
+    def _fmt_duration(seconds):
+        """把秒数格式化为 'X天Y小时' / 'Y小时Z分' / 'Z分钟'。"""
+        seconds = int(seconds or 0)
+        days, rem = divmod(seconds, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes = rem // 60
+        if days:
+            return f"{days}天{hours}小时"
+        if hours:
+            return f"{hours}小时{minutes}分"
+        return f"{minutes}分钟"
+
+    def fetch_user_summary(self):
+        """登录后请求用户信息接口，打印账号信息与数据摘要。"""
+        current = self._fetch_json("https://linux.do/session/current.json")
+        if not isinstance(current, dict) or not current.get("current_user"):
+            logger.warning("获取当前用户失败，跳过数据摘要")
+            return
+        username = current["current_user"].get("username") or ""
+
+        data = (
+            self._fetch_json(f"https://linux.do/u/{username}/summary.json")
+            if username
+            else None
         )
+        if not isinstance(data, dict):
+            logger.warning("获取用户摘要失败，跳过数据摘要")
+            return
 
-        data = {
-            "login": USERNAME,
-            "password": PASSWORD,
-            "second_factor_method": "1",
-            "timezone": "Asia/Shanghai",
-        }
+        users = data.get("users") or []
+        user_info = next(
+            (u for u in users if u.get("username") == username), None
+        ) or (users[0] if users else {})
+        summary = data.get("user_summary") or {}
 
-        try:
-            resp_login = self.session.post(
-                SESSION_URL, data=data, impersonate="chrome136", headers=headers
-            )
+        name = user_info.get("name") or username
+        trust = user_info.get("trust_level")
 
-            if resp_login.status_code == 200:
-                response_json = resp_login.json()
-                if response_json.get("error"):
-                    logger.error(f"登录失败: {response_json.get('error')}")
-                    return False
-                logger.info("登录成功!")
-            else:
-                logger.error(f"登录失败，状态码: {resp_login.status_code}")
-                logger.error(resp_login.text)
-                return False
-        except Exception as e:
-            logger.error(f"登录请求异常: {e}")
-            return False
+        logger.info("============== 用户信息 ==============")
+        logger.info(f"用户名: {username}")
+        if name and name != username:
+            logger.info(f"昵称  : {name}")
+        if trust is not None:
+            logger.info(f"信任等级: Lv{trust}")
 
-        # Step 3: Pass cookies to DrissionPage
-        logger.info("同步 Cookie 到 DrissionPage...")
-
-        cookies_dict = self.session.cookies.get_dict()
-
-        dp_cookies = []
-        for name, value in cookies_dict.items():
-            dp_cookies.append(
-                {
-                    "name": name,
-                    "value": value,
-                    "domain": ".linux.do",
-                    "path": "/",
-                }
-            )
-
-        self.page.set.cookies(dp_cookies)
-
-        logger.info("Cookie 设置完成，导航至 linux.do...")
-        self.page.get(HOME_URL)
-
-        time.sleep(5)
-        try:
-            user_ele = self.page.ele("@id=current-user")
-        except Exception as e:
-            logger.warning(f"登录验证失败: {str(e)}")
-            return True
-        if not user_ele:
-            # Fallback check for avatar
-            if "avatar" in self.page.html:
-                logger.info("登录验证成功 (通过 avatar)")
-                return True
-            logger.error("登录验证失败 (未找到 current-user)")
-            return False
-        else:
-            logger.info("登录验证成功")
-            return True
-
-    def click_topic(self):
-        topic_list = self.page.ele("@id=list-area").eles(".:title")
-        if not topic_list:
-            logger.error("未找到主题帖")
-            return False
-        logger.info(f"发现 {len(topic_list)} 个主题帖，随机选择10个")
-        for topic in random.sample(topic_list, 10):
-            self.click_one_topic(topic.attr("href"))
-        return True
-
-    @retry_decorator()
-    def click_one_topic(self, topic_url):
-        new_page = self.browser.new_tab()
-        try:
-            new_page.get(topic_url)
-            if random.random() < 0.3:  # 0.3 * 30 = 9
-                self.click_like(new_page)
-            self.browse_post(new_page)
-        finally:
-            try:
-                new_page.close()
-            except Exception:
-                pass
-
-    def browse_post(self, page):
-        prev_url = None
-        # 开始自动滚动，最多滚动10次
-        for _ in range(10):
-            # 随机滚动一段距离
-            scroll_distance = random.randint(550, 650)  # 随机滚动 550-650 像素
-            logger.info(f"向下滚动 {scroll_distance} 像素...")
-            page.run_js(f"window.scrollBy(0, {scroll_distance})")
-            logger.info(f"已加载页面: {page.url}")
-
-            if random.random() < 0.03:  # 33 * 4 = 132
-                logger.success("随机退出浏览")
-                break
-
-            # 检查是否到达页面底部
-            at_bottom = page.run_js(
-                "window.scrollY + window.innerHeight >= document.body.scrollHeight"
-            )
-            current_url = page.url
-            if current_url != prev_url:
-                prev_url = current_url
-            elif at_bottom and prev_url == current_url:
-                logger.success("已到达页面底部，退出浏览")
-                break
-
-            # 动态随机等待
-            wait_time = random.uniform(2, 4)  # 随机等待 2-4 秒
-            logger.info(f"等待 {wait_time:.2f} 秒...")
-            time.sleep(wait_time)
+        logger.info("============== 数据摘要 ==============")
+        rows = [
+            ("访问天数", summary.get("days_visited", 0)),
+            ("阅读时间", self._fmt_duration(summary.get("time_read"))),
+            ("最近阅读时间", self._fmt_duration(summary.get("recent_time_read"))),
+            ("浏览的话题", summary.get("topics_entered", 0)),
+            ("已读帖子", summary.get("posts_read_count", 0)),
+            ("已送出(赞)", summary.get("likes_given", 0)),
+            ("已收到(赞)", summary.get("likes_received", 0)),
+            ("书签", summary.get("bookmark_count", 0)),
+            ("创建的话题", summary.get("topic_count", 0)),
+            ("创建的帖子", summary.get("post_count", 0)),
+            ("解决方案", summary.get("solved_count", 0)),
+        ]
+        for k, v in rows:
+            logger.info(f"{k}: {v}")
 
     def run(self):
         try:
-            # 优先使用手动 Cookie 登录，没有再使用账号密码
-            if COOKIES:
-                login_res = self.login_with_cookies(COOKIES)
-                if not login_res:
-                    logger.warning("Cookie 登录失败，尝试账号密码登录...")
-                    login_res = self.login()
-            else:
-                login_res = self.login()
-            if not login_res:  # 登录
+            login_res = self.login_with_cookies(COOKIES)
+            if not login_res:
                 logger.warning("登录验证失败")
-
-            if BROWSE_ENABLED:
-                click_topic_res = self.click_topic()  # 点击主题
-                if not click_topic_res:
-                    logger.error("点击主题失败，程序终止")
-                    return
-                logger.info("完成浏览任务")
-            self.print_connect_info()  # 打印连接信息
-            self.send_notifications(BROWSE_ENABLED)  # 发送通知
+                return
+            self.fetch_user_summary()
         finally:
             try:
                 self.page.close()
@@ -333,56 +294,10 @@ class LinuxDoBrowser:
             except Exception:
                 pass
 
-    def click_like(self, page):
-        try:
-            # 专门查找未点赞的按钮
-            like_button = page.ele(".discourse-reactions-reaction-button")
-            if like_button:
-                logger.info("找到未点赞的帖子，准备点赞")
-                like_button.click()
-                logger.info("点赞成功")
-                time.sleep(random.uniform(1, 2))
-            else:
-                logger.info("帖子可能已经点过赞了")
-        except Exception as e:
-            logger.error(f"点赞失败: {str(e)}")
-
-    def print_connect_info(self):
-        logger.info("获取连接信息")
-        headers = {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        }
-        resp = self.session.get(
-            "https://connect.linux.do/", headers=headers, impersonate="chrome136"
-        )
-        soup = BeautifulSoup(resp.text, "html.parser")
-        rows = soup.select("table tr")
-        info = []
-
-        for row in rows:
-            cells = row.select("td")
-            if len(cells) >= 3:
-                project = cells[0].text.strip()
-                current = cells[1].text.strip() if cells[1].text.strip() else "0"
-                requirement = cells[2].text.strip() if cells[2].text.strip() else "0"
-                info.append([project, current, requirement])
-
-        logger.info("--------------Connect Info-----------------")
-        logger.info("\n" + tabulate(info, headers=["项目", "当前", "要求"], tablefmt="pretty"))
-
-    def send_notifications(self, browse_enabled):
-        """发送签到通知"""
-        status_msg = f"✅每日登录成功: {USERNAME}"
-        if browse_enabled:
-            status_msg += " + 浏览任务完成"
-        
-        # 使用通知管理器发送所有通知
-        self.notifier.send_all("LINUX DO", status_msg)
-
 
 if __name__ == "__main__":
-    if not COOKIES and (not USERNAME or not PASSWORD):
-        print("请设置 LINUXDO_COOKIES（Cookie 登录），或同时设置 USERNAME 和 PASSWORD（账号密码登录）")
+    if not COOKIES:
+        print("请设置 LINUXDO_COOKIES（Cookie 登录）")
         exit(1)
     browser = LinuxDoBrowser()
     browser.run()
