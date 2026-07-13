@@ -8,7 +8,7 @@ import os
 import time
 from dotenv import load_dotenv
 from loguru import logger
-from DrissionPage import ChromiumOptions, Chromium
+from cloakbrowser import launch
 
 load_dotenv()  # 读取本地 .env 文件（青龙/GitHub Actions 无该文件时自动忽略）
 
@@ -16,54 +16,23 @@ os.environ.pop("DISPLAY", None)
 os.environ.pop("DYLD_LIBRARY_PATH", None)
 
 COOKIES = os.environ.get("LINUXDO_COOKIES", "").strip()  # 手动设置的 Cookie 字符串
-# 本地调试用：指定浏览器路径（如 Edge）、是否无头；不设置时默认无头 + 自动探测 Chrome
-BROWSER_PATH = os.environ.get("BROWSER_PATH", "").strip()
+# 本地调试用：是否无头；不设置时默认无头（CloakBrowser 使用自带隐身 Chromium，无需指定浏览器路径）
 HEADLESS = os.environ.get("HEADLESS", "true").strip().lower() not in ("false", "0", "off")
 
 HOME_URL = "https://linux.do/"
 
-# turnstilePatch 扩展：自动求解 Cloudflare Turnstile 质询
-EXTENSION_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "turnstilePatch")
-)
-
 
 class LinuxDoBrowser:
     def __init__(self) -> None:
-        from sys import platform
-
-        if platform == "linux" or platform == "linux2":
-            platformIdentifier = "X11; Linux x86_64"
-        elif platform == "darwin":
-            platformIdentifier = "Macintosh; Intel Mac OS X 10_15_7"
-        elif platform == "win32":
-            platformIdentifier = "Windows NT 10.0; Win64; x64"
-        else:
-            platformIdentifier = "X11; Linux x86_64"
-
-        co = (
-            ChromiumOptions()
-            .headless(HEADLESS)
-            .auto_port(True)
-            .set_argument("--no-sandbox")
-        )
-        if BROWSER_PATH:
-            co.set_browser_path(BROWSER_PATH)
-        # 加载 turnstilePatch 扩展以自动通过 Cloudflare Turnstile 质询
-        # 注意：扩展在无痕模式下不会生效，故改用 auto_port 的临时配置目录隔离每次运行
-        if os.path.exists(EXTENSION_PATH):
-            co.add_extension(EXTENSION_PATH)
-        co.set_user_agent(
-            f"Mozilla/5.0 ({platformIdentifier}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
-        )
-        self.browser = Chromium(co)
-        self.page = self.browser.new_tab()
+        # CloakBrowser：源码级隐身 Chromium，Cloudflare Turnstile 由二进制层面自动放行
+        self.browser = launch(headless=HEADLESS, humanize=True)
+        self.page = self.browser.new_page()
 
     @staticmethod
     def parse_cookie_string(cookie_str: str) -> list[dict]:
         """
         解析浏览器复制的 Cookie 字符串格式: "name1=value1; name2=value2"
-        返回 DrissionPage 所需的 cookie 列表格式。
+        返回 Playwright add_cookies 所需的 cookie 列表格式。
         """
         cookies = []
         for part in cookie_str.strip().split(";"):
@@ -80,130 +49,30 @@ class LinuxDoBrowser:
                 )
         return cookies
 
-    def _detect_cloudflare(self) -> str:
-        """检测页面状态：solved(质询通过) / waiting(CF质询中) / real(真实页面) / loading(加载中)。"""
+    def _on_cf_challenge(self) -> bool:
+        """页面是否仍停在 Cloudflare 质询页（Just a moment / 请稍候）。"""
         try:
-            return self.page.run_js(
-                r"""
-const title = String(document.title || '');
-const tl = title.toLowerCase();
-const bodyText = (document.body ? document.body.innerText : '').slice(0, 800).toLowerCase();
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-const cfWidget = !!document.querySelector('iframe[src*="turnstile"], iframe[src*="/cdn-cgi/challenge-platform/"], div.cf-turnstile, [data-sitekey]');
-const cfInterstitial = tl.includes('just a moment') || tl.includes('attention required') || tl.includes('请稍候')
-  || bodyText.includes('checking your browser') || bodyText.includes('verifying you are human')
-  || bodyText.includes('just a moment') || bodyText.includes('enable javascript and cookies')
-  || bodyText.includes('请稍候');
-const token = String((cfInput && cfInput.value) || '').trim();
-if (token.length >= 80) return 'solved';
-if (cfWidget || cfInterstitial) return 'waiting';
-const realPage = !!document.querySelector('#current-user, .avatar, #list-area, .list-area, .topic-list')
-  || (!!title && !cfInterstitial);
-return realPage ? 'real' : 'loading';
-                """
-            )
+            title = (self.page.title() or "").lower()
         except Exception:
-            return "loading"
+            return False
+        return ("just a moment" in title) or ("请稍候" in title) or ("attention required" in title)
 
-    def _solve_turnstile(self):
-        """主动复用 Turnstile 组件求解：reset 后点击复选框 iframe。"""
-        try:
-            self.page.run_js(
-                "try { if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset(); } catch(e) {}"
-            )
-        except Exception:
-            pass
-        try:
-            challenge_input = self.page.ele("@name=cf-turnstile-response", timeout=1)
-        except Exception:
-            challenge_input = None
-        if challenge_input:
-            try:
-                iframe = challenge_input.parent().shadow_root.ele("tag:iframe")
-                if iframe:
-                    iframe.click()
-                    time.sleep(1)
-            except Exception:
-                pass
-        else:
-            # 兜底：点击可见的 turnstile / 质询平台 iframe
-            try:
-                self.page.run_js(
-                    r"""
-const n = document.querySelector('iframe[src*="turnstile"], iframe[src*="/cdn-cgi/challenge-platform/"]');
-if (n && n.click) n.click();
-                    """
-                )
-            except Exception:
-                pass
+    def wait_for_homepage(self, timeout=45) -> bool:
+        """等待真实首页加载完成（登录态：出现 current-user 或 avatar）。
 
-    def wait_for_cloudflare(self, timeout=30) -> bool:
-        """等待 Cloudflare 质询通过或真实页面加载完成。
-
-        质询存在时依赖 turnstilePatch 扩展自动求解；卡住时主动复用 Turnstile 组件重试。
-        返回 True 表示质询已通过或真实页面已加载，False 表示超时仍在质询中。
+        CloakBrowser 会在二进制层面自动通过 Cloudflare Turnstile，这里只负责等待首页出现。
         """
-        time.sleep(2)  # 等待页面初始加载，避免把加载中误判为已通过
         deadline = time.time() + timeout
-        last_solve_at = 0.0
         while time.time() < deadline:
-            state = self._detect_cloudflare()
-            if state == "solved":
-                logger.success("Cloudflare Turnstile 质询已通过")
-                return True
-            if state == "real":
-                return True
-            if state == "waiting" and time.time() - last_solve_at >= 5:
-                logger.info("Cloudflare 质询进行中，尝试主动求解...")
-                self._solve_turnstile()
-                last_solve_at = time.time()
-            time.sleep(1)
-        still = self._detect_cloudflare()
-        logger.warning(f"Cloudflare 质询等待超时，当前状态: {still}")
-        self._dump_debug("cf_timeout")
-        return still in ("solved", "real")
-
-    def _dump_debug(self, tag="debug"):
-        """落盘调试快照（URL/标题/CF状态/HTML/截图），便于排查 CI 失败。"""
-        debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug")
-        try:
-            os.makedirs(debug_dir, exist_ok=True)
-        except Exception:
-            return
-
-        def _write(name, content):
             try:
-                with open(os.path.join(debug_dir, name), "w", encoding="utf-8") as f:
-                    f.write(str(content))
+                if self.page.query_selector("#current-user"):
+                    return True
+                if self.page.query_selector("img.avatar, .avatar"):
+                    return True
             except Exception:
                 pass
-
-        try:
-            url = self.page.url
-        except Exception:
-            url = ""
-        try:
-            title = self.page.run_js("return document.title || ''") or ""
-        except Exception as e:
-            title = f"<title-error: {e}>"
-        try:
-            state = self._detect_cloudflare()
-        except Exception:
-            state = "unknown"
-        _write(f"{tag}_url.txt", url)
-        _write(f"{tag}_title.txt", title)
-        _write(f"{tag}_cfstate.txt", state)
-        try:
-            _write(f"{tag}_page.html", (self.page.html or "")[:200000])
-        except Exception as e:
-            _write(f"{tag}_page_error.txt", repr(e))
-        try:
-            self.page.get_screenshot(
-                path=os.path.join(debug_dir, f"{tag}_screenshot.png"), full_page=True
-            )
-        except Exception as e:
-            _write(f"{tag}_screenshot_error.txt", repr(e))
-        logger.info(f"调试快照已保存到 {debug_dir} ({tag})")
+            time.sleep(1)
+        return False
 
     def login_with_cookies(self, cookie_str: str) -> bool:
         """使用手动设置的 Cookie 直接登录"""
@@ -214,46 +83,33 @@ if (n && n.click) n.click();
             return False
 
         logger.info(f"成功解析 {len(dp_cookies)} 个 Cookie 条目")
-
-        # 设置 Cookie 到 DrissionPage
-        self.page.set.cookies(dp_cookies)
+        self.page.context.add_cookies(dp_cookies)
         logger.info("Cookie 设置完成，导航至 linux.do...")
-        self.page.get(HOME_URL)
+        self.page.goto(HOME_URL, wait_until="domcontentloaded")
 
-        # 处理 Cloudflare Turnstile 质询
-        self.wait_for_cloudflare(timeout=30)
-
-        # 验证登录状态
-        try:
-            user_ele = self.page.ele("@id=current-user")
-        except Exception as e:
-            logger.warning(f"Cookie 登录验证异常: {str(e)}")
-            return True
-        if not user_ele:
-            if "avatar" in self.page.html:
-                logger.info("Cookie 登录验证成功 (通过 avatar)")
-                return True
-            logger.error("Cookie 登录验证失败 (未找到 current-user)，Cookie 可能已过期")
-            self._dump_debug("login_fail")
-            return False
-        else:
+        if self.wait_for_homepage(timeout=45):
             logger.info("Cookie 登录验证成功")
             return True
+        if self._on_cf_challenge():
+            logger.error("Cloudflare 质询未通过（CloakBrowser 未能自动放行），可能需要住宅代理")
+        else:
+            logger.error("登录验证失败：未进入登录态首页，Cookie 可能已过期")
+        self._dump_debug("login_fail")
+        return False
 
     def _fetch_json(self, url):
-        """在已登录的页面上下文中用同步 XHR 请求 JSON 接口（自带 cookie 与 CF 放行）。"""
+        """在已登录的页面上下文中用同步 XHR 请求 JSON 接口（自带 cookie）。"""
         try:
-            text = self.page.run_js(
-                r"""
-const url = arguments[0];
-const xhr = new XMLHttpRequest();
-xhr.open('GET', url, false);
-xhr.setRequestHeader('Accept', 'application/json, text/javascript, */*; q=0.01');
-xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
-xhr.send();
-if (xhr.status !== 200) return 'HTTP_ERROR:' + xhr.status;
-return xhr.responseText;
-                """,
+            text = self.page.evaluate(
+                """(url) => {
+                    const xhr = new XMLHttpRequest();
+                    xhr.open('GET', url, false);
+                    xhr.setRequestHeader('Accept', 'application/json, text/javascript, */*; q=0.01');
+                    xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+                    xhr.send();
+                    if (xhr.status !== 200) return 'HTTP_ERROR:' + xhr.status;
+                    return xhr.responseText;
+                }""",
                 url,
             )
         except Exception as e:
@@ -331,6 +187,43 @@ return xhr.responseText;
         for k, v in rows:
             logger.info(f"{k}: {v}")
 
+    def _dump_debug(self, tag="debug"):
+        """落盘调试快照（URL/标题/CF状态/HTML/截图），便于排查失败。"""
+        debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug")
+        try:
+            os.makedirs(debug_dir, exist_ok=True)
+        except Exception:
+            return
+
+        def _write(name, content):
+            try:
+                with open(os.path.join(debug_dir, name), "w", encoding="utf-8") as f:
+                    f.write(str(content))
+            except Exception:
+                pass
+
+        try:
+            url = self.page.url
+        except Exception:
+            url = ""
+        try:
+            title = self.page.title() or ""
+        except Exception as e:
+            title = f"<title-error: {e}>"
+        cfstate = "challenge" if self._on_cf_challenge() else "other"
+        _write(f"{tag}_url.txt", url)
+        _write(f"{tag}_title.txt", title)
+        _write(f"{tag}_cfstate.txt", cfstate)
+        try:
+            _write(f"{tag}_page.html", (self.page.content() or "")[:200000])
+        except Exception as e:
+            _write(f"{tag}_page_error.txt", repr(e))
+        try:
+            self.page.screenshot(path=os.path.join(debug_dir, f"{tag}_screenshot.png"), full_page=True)
+        except Exception as e:
+            _write(f"{tag}_screenshot_error.txt", repr(e))
+        logger.info(f"调试快照已保存到 {debug_dir} ({tag})")
+
     def run(self):
         try:
             login_res = self.login_with_cookies(COOKIES)
@@ -340,11 +233,7 @@ return xhr.responseText;
             self.fetch_user_summary()
         finally:
             try:
-                self.page.close()
-            except Exception:
-                pass
-            try:
-                self.browser.quit()
+                self.browser.close()
             except Exception:
                 pass
 
