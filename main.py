@@ -10,6 +10,8 @@ from dotenv import load_dotenv
 from loguru import logger
 from cloakbrowser import launch
 
+import tasks
+
 load_dotenv()  # 读取本地 .env 文件（青龙/GitHub Actions 无该文件时自动忽略）
 
 os.environ.pop("DISPLAY", None)
@@ -238,6 +240,7 @@ class LinuxDoBrowser:
                 logger.warning("登录验证失败")
                 return
             self.fetch_user_summary()
+            tasks.run_tasks(self.page)
         finally:
             try:
                 self.browser.close()
