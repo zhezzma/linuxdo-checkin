@@ -90,7 +90,7 @@ const tl = title.toLowerCase();
 const bodyText = (document.body ? document.body.innerText : '').slice(0, 800).toLowerCase();
 const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
 const cfWidget = !!document.querySelector('iframe[src*="turnstile"], iframe[src*="/cdn-cgi/challenge-platform/"], div.cf-turnstile, [data-sitekey]');
-const cfInterstitial = tl.includes('just a moment') || tl.includes('attention required')
+const cfInterstitial = tl.includes('just a moment') || tl.includes('attention required') || tl.includes('请稍候')
   || bodyText.includes('checking your browser') || bodyText.includes('verifying you are human')
   || bodyText.includes('just a moment') || bodyText.includes('enable javascript and cookies')
   || bodyText.includes('请稍候');
