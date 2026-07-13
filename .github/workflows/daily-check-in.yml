@@ -25,7 +25,7 @@ jobs:
 
       - name: Install browser OS dependencies
         run: |
-          sudo python -m playwright install-deps chromium
+          python -m playwright install-deps chromium
 
       - name: Execute script
         env:
