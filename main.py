@@ -81,20 +81,29 @@ class LinuxDoBrowser:
         return cookies
 
     def _detect_cloudflare(self) -> str:
-        """检测当前页面 Cloudflare 质询状态：none / waiting / solved。"""
+        """检测页面状态：solved(质询通过) / waiting(CF质询中) / real(真实页面) / loading(加载中)。"""
         try:
             return self.page.run_js(
                 r"""
+const title = String(document.title || '');
+const tl = title.toLowerCase();
+const bodyText = (document.body ? document.body.innerText : '').slice(0, 800).toLowerCase();
 const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-const cfPresent = !!cfInput
-  || !!document.querySelector('iframe[src*="turnstile"], iframe[src*="/cdn-cgi/challenge-platform/"], div.cf-turnstile, [data-sitekey]');
-if (!cfPresent) return 'none';
+const cfWidget = !!document.querySelector('iframe[src*="turnstile"], iframe[src*="/cdn-cgi/challenge-platform/"], div.cf-turnstile, [data-sitekey]');
+const cfInterstitial = tl.includes('just a moment') || tl.includes('attention required')
+  || bodyText.includes('checking your browser') || bodyText.includes('verifying you are human')
+  || bodyText.includes('just a moment') || bodyText.includes('enable javascript and cookies')
+  || bodyText.includes('请稍候');
 const token = String((cfInput && cfInput.value) || '').trim();
-return token.length >= 80 ? 'solved' : 'waiting';
+if (token.length >= 80) return 'solved';
+if (cfWidget || cfInterstitial) return 'waiting';
+const realPage = !!document.querySelector('#current-user, .avatar, #list-area, .list-area, .topic-list')
+  || (!!title && !cfInterstitial);
+return realPage ? 'real' : 'loading';
                 """
             )
         except Exception:
-            return "none"
+            return "loading"
 
     def _solve_turnstile(self):
         """主动复用 Turnstile 组件求解：reset 后点击复选框 iframe。"""
@@ -129,28 +138,72 @@ if (n && n.click) n.click();
                 pass
 
     def wait_for_cloudflare(self, timeout=30) -> bool:
-        """等待 Cloudflare Turnstile 质询通过。
+        """等待 Cloudflare 质询通过或真实页面加载完成。
 
-        依赖 turnstilePatch 扩展自动求解；卡住时主动复用 Turnstile 组件重试。
-        返回 True 表示质询已通过或不存在，False 表示超时仍在质询中。
+        质询存在时依赖 turnstilePatch 扩展自动求解；卡住时主动复用 Turnstile 组件重试。
+        返回 True 表示质询已通过或真实页面已加载，False 表示超时仍在质询中。
         """
-        time.sleep(2)  # 等待质询平台 iframe 加载，避免误判为无质询
+        time.sleep(2)  # 等待页面初始加载，避免把加载中误判为已通过
         deadline = time.time() + timeout
         last_solve_at = 0.0
         while time.time() < deadline:
             state = self._detect_cloudflare()
-            if state in ("none", "solved"):
-                if state == "solved":
-                    logger.success("Cloudflare Turnstile 质询已通过")
+            if state == "solved":
+                logger.success("Cloudflare Turnstile 质询已通过")
                 return True
-            if time.time() - last_solve_at >= 5:
+            if state == "real":
+                return True
+            if state == "waiting" and time.time() - last_solve_at >= 5:
                 logger.info("Cloudflare 质询进行中，尝试主动求解...")
                 self._solve_turnstile()
                 last_solve_at = time.time()
             time.sleep(1)
         still = self._detect_cloudflare()
         logger.warning(f"Cloudflare 质询等待超时，当前状态: {still}")
-        return still in ("none", "solved")
+        self._dump_debug("cf_timeout")
+        return still in ("solved", "real")
+
+    def _dump_debug(self, tag="debug"):
+        """落盘调试快照（URL/标题/CF状态/HTML/截图），便于排查 CI 失败。"""
+        debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug")
+        try:
+            os.makedirs(debug_dir, exist_ok=True)
+        except Exception:
+            return
+
+        def _write(name, content):
+            try:
+                with open(os.path.join(debug_dir, name), "w", encoding="utf-8") as f:
+                    f.write(str(content))
+            except Exception:
+                pass
+
+        try:
+            url = self.page.url
+        except Exception:
+            url = ""
+        try:
+            title = self.page.run_js("return document.title || ''") or ""
+        except Exception as e:
+            title = f"<title-error: {e}>"
+        try:
+            state = self._detect_cloudflare()
+        except Exception:
+            state = "unknown"
+        _write(f"{tag}_url.txt", url)
+        _write(f"{tag}_title.txt", title)
+        _write(f"{tag}_cfstate.txt", state)
+        try:
+            _write(f"{tag}_page.html", (self.page.html or "")[:200000])
+        except Exception as e:
+            _write(f"{tag}_page_error.txt", repr(e))
+        try:
+            self.page.get_screenshot(
+                path=os.path.join(debug_dir, f"{tag}_screenshot.png"), full_page=True
+            )
+        except Exception as e:
+            _write(f"{tag}_screenshot_error.txt", repr(e))
+        logger.info(f"调试快照已保存到 {debug_dir} ({tag})")
 
     def login_with_cookies(self, cookie_str: str) -> bool:
         """使用手动设置的 Cookie 直接登录"""
@@ -181,6 +234,7 @@ if (n && n.click) n.click();
                 logger.info("Cookie 登录验证成功 (通过 avatar)")
                 return True
             logger.error("Cookie 登录验证失败 (未找到 current-user)，Cookie 可能已过期")
+            self._dump_debug("login_fail")
             return False
         else:
             logger.info("Cookie 登录验证成功")

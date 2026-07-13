@@ -29,8 +29,18 @@ jobs:
       - name: Execute script
         env:
           LINUXDO_COOKIES: ${{ secrets.LINUXDO_COOKIES }}
+          PYTHONUTF8: '1'
         run: |
           python main.py
+
+      - name: Upload debug snapshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-snapshots
+          path: debug/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Delete workflow runs
         uses: Mattraks/delete-workflow-runs@v2
