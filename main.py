@@ -18,6 +18,8 @@ os.environ.pop("DYLD_LIBRARY_PATH", None)
 COOKIES = os.environ.get("LINUXDO_COOKIES", "").strip()  # 手动设置的 Cookie 字符串
 # 本地调试用：是否无头；不设置时默认无头（CloakBrowser 使用自带隐身 Chromium，无需指定浏览器路径）
 HEADLESS = os.environ.get("HEADLESS", "true").strip().lower() not in ("false", "0", "off")
+# 可选：代理地址(http/https/socks5)，配合住宅代理可绕过数据中心 IP 的 CF 拦截；留空则直连
+PROXY = os.environ.get("PROXY", "").strip()
 
 HOME_URL = "https://linux.do/"
 
@@ -25,7 +27,12 @@ HOME_URL = "https://linux.do/"
 class LinuxDoBrowser:
     def __init__(self) -> None:
         # CloakBrowser：源码级隐身 Chromium，Cloudflare Turnstile 由二进制层面自动放行
-        self.browser = launch(headless=HEADLESS, humanize=True)
+        launch_kwargs = {"headless": HEADLESS, "humanize": True}
+        if PROXY:
+            launch_kwargs["proxy"] = PROXY
+            host = PROXY.split("@")[-1] if "@" in PROXY else PROXY
+            logger.info(f"使用代理: {host}")
+        self.browser = launch(**launch_kwargs)
         self.page = self.browser.new_page()
 
     @staticmethod

@@ -30,6 +30,7 @@ jobs:
       - name: Execute script
         env:
           LINUXDO_COOKIES: ${{ secrets.LINUXDO_COOKIES }}
+          PROXY: ${{ secrets.PROXY }}
           PYTHONUTF8: '1'
         run: |
           python main.py

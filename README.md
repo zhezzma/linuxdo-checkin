@@ -22,6 +22,8 @@
 | 环境变量名称            | 描述                           | 示例值                          |
 |-------------------|------------------------------|------------------------------|
 | `LINUXDO_COOKIES` | 从浏览器 DevTools 复制的 Cookie 字符串 | `_t=xxx; _forum_session=yyy` |
+| `PROXY`           | 可选，代理地址(http/https/socks5)；配合住宅代理可绕过数据中心 IP 的 CF 拦截 | `http://user:pass@host:port` |
+| `HEADLESS`        | 可选，是否无头；本地调试设 `false` 可观察浏览器 | `false` |
 
 > 本地运行时，可将上述变量写入项目根目录的 `.env` 文件（脚本会自动加载，依赖 `python-dotenv`）。
 
