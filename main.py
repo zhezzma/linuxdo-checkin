@@ -25,6 +25,50 @@ PROXY = os.environ.get("PROXY", "").strip()
 
 HOME_URL = "https://linux.do/"
 
+# Cloudflare Turnstile 求解辅助（移植自 grok_register_camoufox.py）
+# 在 Turnstile iframe 内注入随机的 screenX/screenY，避免合成点击被识别
+_TURNSTILE_SCREEN_PATCH_JS = """
+(() => {
+  if (window.dtp) return;
+  window.dtp = 1;
+  const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+  const sx = rand(800, 1200);
+  const sy = rand(400, 700);
+  try { Object.defineProperty(MouseEvent.prototype, 'screenX', { get() { return sx; } }); } catch (e) {}
+  try { Object.defineProperty(MouseEvent.prototype, 'screenY', { get() { return sy; } }); } catch (e) {}
+})();
+"""
+# 在 Turnstile iframe 内定位 checkbox 点击点（closed shadow 下 CSS 选择器不可靠，
+# 改为遍历找可见 input 中心，回退到左侧热区）
+_TURNSTILE_CLICK_POINT_JS = """
+() => {
+  function findInput(root, depth) {
+    if (!root || depth > 6) return null;
+    const nodes = root.querySelectorAll ? root.querySelectorAll('*') : [];
+    for (const el of nodes) {
+      if (el.tagName === 'INPUT') {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) {
+          return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+        }
+      }
+      if (el.shadowRoot) {
+        const hit = findInput(el.shadowRoot, depth + 1);
+        if (hit) return hit;
+      }
+    }
+    return null;
+  }
+  const hit = findInput(document, 0);
+  if (hit) return hit;
+  const b = document.body && document.body.getBoundingClientRect();
+  if (b && b.width > 20 && b.height > 20) {
+    return { x: b.x + 22, y: b.y + b.height / 2 };
+  }
+  return null;
+}
+"""
+
 
 class LinuxDoBrowser:
     def __init__(self) -> None:
@@ -66,13 +110,101 @@ class LinuxDoBrowser:
             return False
         return ("just a moment" in title) or ("请稍候" in title) or ("attention required" in title)
 
-    def wait_for_homepage(self, timeout=45) -> bool:
+    def _iter_turnstile_frames(self):
+        """枚举页面里的 Cloudflare Turnstile iframe。"""
+        for frame in self.page.frames:
+            url = (frame.url or "").lower()
+            if "challenges.cloudflare.com" in url or "turnstile" in url:
+                yield frame
+
+    def _click_turnstile_checkbox(self) -> bool:
+        """定位 Turnstile iframe 并用真实鼠标点击 checkbox，触发自动求解。
+
+        closed shadow 下 CSS 选择器不可靠，因此定位 frame 内可见 input 的中心
+        或左侧热区，再用 page.mouse 真实点击（humanize 会模拟真人移动）。
+        """
+        for frame in self._iter_turnstile_frames():
+            try:
+                frame.evaluate(_TURNSTILE_SCREEN_PATCH_JS)
+            except Exception:
+                pass
+            try:
+                frame.wait_for_function(
+                    """() => {
+  const b = document.body;
+  if (!b) return false;
+  if (b.childElementCount > 0) return true;
+  if (b.innerHTML && b.innerHTML.length > 20) return true;
+  const r = b.getBoundingClientRect();
+  return r.width > 20 && r.height > 20;
+}""",
+                    timeout=5000,
+                )
+            except Exception:
+                pass
+            try:
+                point = frame.evaluate(_TURNSTILE_CLICK_POINT_JS)
+            except Exception:
+                point = None
+            try:
+                box = frame.frame_element().bounding_box()
+            except Exception:
+                box = None
+            if not box or box.get("width", 0) <= 20 or box.get("height", 0) <= 20:
+                continue
+            if point and point.get("x") is not None:
+                abs_x = box["x"] + float(point["x"])
+                abs_y = box["y"] + float(point["y"])
+            else:
+                abs_x = box["x"] + min(28.0, box["width"] * 0.15)
+                abs_y = box["y"] + box["height"] / 2
+            try:
+                self.page.mouse.click(abs_x, abs_y)
+                logger.info(f"已点击 Turnstile @({int(abs_x)},{int(abs_y)})")
+                return True
+            except Exception as exc:
+                logger.warning(f"Turnstile 点击失败: {exc}")
+        return False
+
+    def _solve_turnstile(self, timeout=60) -> bool:
+        """主动求解 Turnstile：质询页消失或拿到 token 视为通过。"""
+        deadline = time.time() + timeout
+        last_click_at = 0.0
+        while time.time() < deadline:
+            if not self._on_cf_challenge():
+                logger.info("Cloudflare 质询已通过")
+                return True
+            try:
+                token = self.page.evaluate(
+                    """() => String((document.querySelector('input[name="cf-turnstile-response"]') || {}).value || '').trim()"""
+                )
+                if len(str(token or "")) >= 80:
+                    logger.info(f"Turnstile 已通过，token长度={len(token)}")
+                    return True
+            except Exception:
+                pass
+            now = time.time()
+            if now - last_click_at >= 5:
+                self._click_turnstile_checkbox()
+                last_click_at = now
+            time.sleep(2)
+        return False
+
+    def wait_for_homepage(self, timeout=90) -> bool:
         """等待真实首页加载完成（登录态：出现 current-user 或 avatar）。
 
-        CloakBrowser 会在二进制层面自动通过 Cloudflare Turnstile，这里只负责等待首页出现。
+        遇到 Cloudflare 质询页时，主动求解 Turnstile（移植自 grok_register_camoufox.py
+        的点击 checkbox 方案，配合代理绕过数据中心 IP 拦截）。
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
+            if self._on_cf_challenge():
+                logger.warning("检测到 Cloudflare 质询，主动求解 Turnstile...")
+                remaining = max(20, int(deadline - time.time()))
+                if not self._solve_turnstile(timeout=remaining):
+                    logger.error("Turnstile 求解超时")
+                    return False
+                continue
             try:
                 if self.page.query_selector("#current-user"):
                     return True
@@ -96,7 +228,7 @@ class LinuxDoBrowser:
         logger.info("Cookie 设置完成，导航至 linux.do...")
         self.page.goto(HOME_URL, wait_until="domcontentloaded")
 
-        if self.wait_for_homepage(timeout=45):
+        if self.wait_for_homepage(timeout=90):
             logger.info("Cookie 登录验证成功")
             return True
         if self._on_cf_challenge():
